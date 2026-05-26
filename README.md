@@ -2,8 +2,9 @@
 
 Serves the ATP rule registry to LTC over NATS. Reads YAML rule files from
 disk, replies to `rss.snapshot.request`, broadcasts `rss.heartbeat` every
-5 s, and (in the next phase) pushes per-rule deltas to LTC on the
-JetStream `RULE_UPDATES` stream as files change.
+5 s, and pushes per-rule deltas (upsert / delete) to LTC on the JetStream
+`RULE_UPDATES` stream as files change — fsnotify-watched with a 100 ms
+debounce so editor temp-write+rename bursts collapse to one delta.
 
 See `CLAUDE.md` for the NATS contract and operational conventions. See
 `../CLAUDE.md` for workspace architecture.
