@@ -1,0 +1,20 @@
+# Sample rule fixture for local RSS dev.
+#
+# Mirrors the canary pattern from platform-e2e: a SPY-driven rule with a
+# minimum follower reference so LTC's load-time follower-reference gate
+# accepts it. Replace this directory's contents with your own fixtures
+# in real use; RSS is fixture-agnostic.
+id: sample_canary
+version: 1
+description: |
+  RSS sample fixture. Fires when SPY's bid percent-change vs yesterday's
+  close exceeds 0.1 %, and the follower is not halted.
+drivers: [SPY]
+followers: [test_sorter]
+when: |
+  ticker("SPY").bid_p_cl_ch > 0.001 && ticker(follower).halted == false
+emit:
+  subject: signals.sample_canary
+  payload:
+    follower: "{{follower}}"
+    rule: sample_canary

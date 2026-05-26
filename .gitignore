@@ -1,0 +1,34 @@
+# Compiled binary (built via `go build -o tss ./cmd/tss`)
+/tss
+
+# Go build/test artifacts
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env / secrets
+.env
+.env.local
+
+# AI tooling
+CLAUDE.md
+.claude/
+
+# Local temp reports (coverage HTML, profiling output, ad-hoc dumps)
+/reports/*
