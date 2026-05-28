@@ -1,4 +1,4 @@
-# rss — Rule Storage Service
+# RSS — Rule Storage Service
 
 Serves the ATP rule registry to LTC over NATS. Reads YAML rule files from
 disk, replies to `rss.snapshot.request`, broadcasts `rss.heartbeat` every
