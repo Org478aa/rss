@@ -202,8 +202,8 @@ func TestPublishDelta_RoundTripsViaJetStream(t *testing.T) {
 		if rd.RuleID != "rule_a" || rd.Operation != model.OperationUpsert {
 			t.Errorf("delta = %+v; want rule_a upsert", rd)
 		}
-		if rd.SnapshotVersion != 1 || rd.RuleVersion != 1 {
-			t.Errorf("versions = (snapshot %d, rule %d); want (1, 1)", rd.SnapshotVersion, rd.RuleVersion)
+		if rd.SnapshotVersion <= 0 || rd.RuleVersion <= 0 {
+			t.Errorf("versions = (snapshot %d, rule %d); want both > 0", rd.SnapshotVersion, rd.RuleVersion)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for delta on rss.updates")

@@ -104,8 +104,8 @@ func TestWatcher_NewFile_PublishesUpsert(t *testing.T) {
 	if got[0].RuleID != "alpha" {
 		t.Errorf("rule_id = %q; want alpha", got[0].RuleID)
 	}
-	if got[0].RuleVersion != 1 || got[0].SnapshotVersion != 1 {
-		t.Errorf("versions = (snap=%d, rule=%d); want (1, 1)", got[0].SnapshotVersion, got[0].RuleVersion)
+	if got[0].RuleVersion <= 0 || got[0].SnapshotVersion <= 0 {
+		t.Errorf("versions = (snap=%d, rule=%d); want both > 0", got[0].SnapshotVersion, got[0].RuleVersion)
 	}
 	if entry, ok := reg.Get("alpha"); !ok || entry.YAML == "" {
 		t.Errorf("registry missing alpha after watcher fire: %+v", entry)

@@ -20,13 +20,21 @@ import (
 
 // Registry is the in-memory rule set, versioned at two levels:
 //
-//   - snapshotVersion: monotonic counter across the whole registry; bumps
-//     on every Upsert and every Delete. Returned in the SnapshotReply and
-//     stamped on every RuleDelta so consumers (LTC) can drop redeliveries
-//     and out-of-order messages.
+//   - snapshotVersion: monotonic across the whole registry; bumps on every
+//     Upsert and every Delete. Returned in the SnapshotReply and stamped
+//     on every RuleDelta so consumers (LTC) can drop redeliveries and
+//     out-of-order messages.
 //   - per-rule version (RuleEntry.RuleVersion): bumps only when that
 //     specific rule changes. Lets LTC apply per-rule monotonicity in
 //     addition to the global gate.
+//
+// Both versions are unix-nano timestamps generated via bumpVersion, which
+// returns max(prev+1, time.Now().UnixNano()). Wall-clock seeding means a
+// restarted RSS picks a fresh starting point strictly larger than any
+// version it published in a prior process — without that, restart-then-edit
+// produced version numbers LTC had already absorbed and silently dropped.
+// The max(prev+1, ...) guard preserves monotonicity even if two writes
+// land in the same nanosecond or if the clock steps backwards.
 //
 // Source is a tag carried in SnapshotReply.Source / Heartbeat.Source so
 // operators can tell a process apart from its tests at a glance ("disk"
@@ -36,6 +44,16 @@ type Registry struct {
 	source          string
 	snapshotVersion int64
 	rules           map[string]model.RuleEntry
+}
+
+// bumpVersion returns the next monotonic version: time.Now().UnixNano()
+// if that's strictly larger than prev, else prev+1.
+func bumpVersion(prev int64) int64 {
+	now := time.Now().UnixNano()
+	if now > prev {
+		return now
+	}
+	return prev + 1
 }
 
 // New returns an empty registry. The caller seeds it with Upsert calls
@@ -115,11 +133,13 @@ func (r *Registry) Upsert(id, yaml string) (model.RuleDelta, bool) {
 		return model.RuleDelta{}, false
 	}
 
-	nextRuleVersion := int64(1)
+	var nextRuleVersion int64
 	if exists {
-		nextRuleVersion = prev.RuleVersion + 1
+		nextRuleVersion = bumpVersion(prev.RuleVersion)
+	} else {
+		nextRuleVersion = bumpVersion(0)
 	}
-	r.snapshotVersion++
+	r.snapshotVersion = bumpVersion(r.snapshotVersion)
 	r.rules[id] = model.RuleEntry{
 		ID:          id,
 		YAML:        yaml,
@@ -153,7 +173,7 @@ func (r *Registry) Delete(id string) (model.RuleDelta, bool) {
 		return model.RuleDelta{}, false
 	}
 	delete(r.rules, id)
-	r.snapshotVersion++
+	r.snapshotVersion = bumpVersion(r.snapshotVersion)
 	return model.RuleDelta{
 		Operation:       model.OperationDelete,
 		RuleID:          id,
@@ -193,8 +213,8 @@ func (r *Registry) ReplaceAll(entries map[string]string) (int, error) {
 
 	r.rules = make(map[string]model.RuleEntry, len(entries))
 	for id, yaml := range entries {
-		r.rules[id] = model.RuleEntry{ID: id, YAML: yaml, RuleVersion: 1}
+		r.rules[id] = model.RuleEntry{ID: id, YAML: yaml, RuleVersion: bumpVersion(0)}
 	}
-	r.snapshotVersion++
+	r.snapshotVersion = bumpVersion(r.snapshotVersion)
 	return len(r.rules), nil
 }
