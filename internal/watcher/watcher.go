@@ -14,7 +14,23 @@
 //     resolved to the id it referred to (the file is gone, so we can no
 //     longer read the id out of it). The map is populated at Seed time
 //     from the initial load and maintained on every upsert.
+//   - It also tracks the inverse id → owning-path so the startup
+//     duplicate-id invariant (LoadDir rejects two files sharing an id)
+//     holds at runtime too: a second file introducing an already-owned id
+//     is skipped, and a delete only evicts a rule when the removed path is
+//     the one that owns it.
 //   - Non-YAML files (anything not matching *.yaml / *.yml) are ignored.
+//
+// Ordering + durability: a single fireMu serializes the whole
+// mutate-registry → publish-delta section. The registry assigns a
+// monotonic snapshot_version per mutation and LTC drops any delta that
+// isn't strictly newer than the last it applied, so version order must
+// equal wire order — two files saved within one debounce window would
+// otherwise run concurrent fire() goroutines that publish out of order.
+// Within that serialized section publish retries until the broker acks or
+// the context is cancelled; RSS deliberately stops absorbing new edits
+// during a broker outage rather than letting registry state run ahead of
+// what it has shipped to LTC.
 package watcher
 
 import (
@@ -56,6 +72,16 @@ type Publisher interface {
 // before Start; no concurrent mutation.
 var DebounceWindow = 100 * time.Millisecond
 
+// publishRetryInitial / publishRetryMax bound the capped-exponential
+// backoff the watcher uses when a delta publish fails (broker briefly
+// unreachable). Declared as var so tests can shrink them. The retry runs
+// while fireMu is held, so a sustained outage pauses new edits — see the
+// package doc.
+var (
+	publishRetryInitial = 50 * time.Millisecond
+	publishRetryMax     = 2 * time.Second
+)
+
 // Watcher couples an fsnotify.Watcher with a per-path debouncer and the
 // registry/publisher pair that turns each fired debouncer into a wire
 // event.
@@ -64,11 +90,19 @@ type Watcher struct {
 	registry  Registry
 	publisher Publisher
 
+	// fireMu serializes the mutate→publish section of fire() so the
+	// registry's version order equals the order deltas reach the wire.
+	// Held across publish retries; never nested inside mu.
+	fireMu sync.Mutex
+
 	// pathToID maps watched file paths to the rule_id last observed there.
 	// Required to translate a Remove event (where we can't read the file
-	// anymore) into a Delete(id) call. Mutated under mu.
+	// anymore) into a Delete(id) call. idToPath is the inverse, naming the
+	// path that currently owns each id, used to enforce the duplicate-id
+	// invariant at runtime. Both mutated under mu.
 	mu       sync.Mutex
 	pathToID map[string]string
+	idToPath map[string]string
 
 	// pending tracks the per-path debouncer state. Mutated under mu.
 	pending map[string]*pendingFile
@@ -89,6 +123,7 @@ func New(dir string, reg Registry, pub Publisher) *Watcher {
 		registry:  reg,
 		publisher: pub,
 		pathToID:  make(map[string]string, 16),
+		idToPath:  make(map[string]string, 16),
 		pending:   make(map[string]*pendingFile, 16),
 	}
 }
@@ -102,6 +137,9 @@ func (w *Watcher) Seed(files []loader.File) {
 	defer w.mu.Unlock()
 	for _, f := range files {
 		w.pathToID[f.Path] = f.ID
+		// LoadDir already rejected duplicate ids, so this inverse map is
+		// unambiguous at seed time: each id maps to exactly one path.
+		w.idToPath[f.ID] = f.Path
 	}
 }
 
@@ -181,7 +219,16 @@ func (w *Watcher) schedule(ctx context.Context, path string) {
 // fire runs after the debounce window. It removes the path's entry from
 // `pending`, then decides between Upsert and Delete based on whether the
 // file currently exists.
+//
+// The whole body holds fireMu: registry mutation assigns the monotonic
+// snapshot_version and the matching publish must reach the wire in that
+// same order (LTC drops anything not strictly newer than it holds). One
+// lock makes version order == wire order and keeps the registry from
+// advancing past a delta we couldn't ship.
 func (w *Watcher) fire(ctx context.Context, path string) {
+	w.fireMu.Lock()
+	defer w.fireMu.Unlock()
+
 	w.mu.Lock()
 	delete(w.pending, path)
 	prevID := w.pathToID[path]
@@ -199,47 +246,130 @@ func (w *Watcher) fire(ctx context.Context, path string) {
 			slog.Debug("watcher: ignoring transient", "path", path, "err", err)
 			return
 		}
+
+		// Only evict the rule if THIS path is the one that owns the id, so a
+		// duplicate-id file being removed can't delete the rule the surviving
+		// file still defines. Defensive: because the upsert side rejects an
+		// id another path owns (and never remembers the rejected file), no
+		// two paths share an id today, so prevID being set implies this path
+		// owns it. Kept so the invariant is enforced at the delete site too,
+		// not assumed.
+		w.mu.Lock()
+		owner := w.idToPath[prevID]
+		w.mu.Unlock()
+		if owner != path {
+			w.mu.Lock()
+			delete(w.pathToID, path)
+			w.mu.Unlock()
+			slog.Info("watcher: duplicate-id file removed; rule retained",
+				"rule_id", prevID, "path", path, "owner", owner)
+			return
+		}
+
 		delta, changed := w.registry.Delete(prevID)
 		if !changed {
+			w.forget(path, prevID)
 			return
 		}
-		w.mu.Lock()
-		delete(w.pathToID, path)
-		w.mu.Unlock()
-		if err := w.publisher.PublishDelta(ctx, delta); err != nil {
-			slog.Warn("publish delete failed", "rule_id", prevID, "err", err)
+		if !w.publish(ctx, delta) {
+			slog.Error("delete delta abandoned at shutdown; LTC keeps the stale rule until its next snapshot",
+				"rule_id", prevID, "path", path)
 			return
 		}
+		w.forget(path, prevID)
 		slog.Info("rule deleted", "rule_id", prevID, "path", path)
 		return
 	}
 
+	// File exists → upsert. Enforce the duplicate-id invariant first: a
+	// second file introducing an id another path already owns is rejected,
+	// the same way LoadDir rejects it at startup.
+	w.mu.Lock()
+	owner, owned := w.idToPath[f.ID]
+	w.mu.Unlock()
+	if owned && owner != path {
+		slog.Warn("duplicate rule id; ignoring file (another file owns this id)",
+			"rule_id", f.ID, "path", path, "owner", owner)
+		return
+	}
+
 	// File exists. If the rule id moved (operator renamed a file's id
-	// in-place), we need to delete the previous id before upserting.
+	// in-place), delete the previous id before upserting the new one.
 	if prevID != "" && prevID != f.ID {
 		if delta, changed := w.registry.Delete(prevID); changed {
-			if err := w.publisher.PublishDelta(ctx, delta); err != nil {
-				slog.Warn("publish rename-delete failed", "old_id", prevID, "err", err)
-			} else {
-				slog.Info("rule deleted (renamed)", "old_id", prevID, "new_id", f.ID, "path", path)
+			if !w.publish(ctx, delta) {
+				slog.Error("rename-delete delta abandoned at shutdown", "old_id", prevID, "path", path)
+				return
 			}
+			w.mu.Lock()
+			delete(w.idToPath, prevID)
+			w.mu.Unlock()
+			slog.Info("rule deleted (renamed)", "old_id", prevID, "new_id", f.ID, "path", path)
 		}
 	}
 
 	delta, changed := w.registry.Upsert(f.ID, f.YAML)
 	if !changed {
-		// No-op upsert (file touched but content identical). Suppress
-		// the wire event so editors that touch + save don't spam.
+		// No-op upsert (file touched but content identical). Suppress the
+		// wire event, but still record ownership so a later delete resolves
+		// correctly.
+		w.remember(path, f.ID)
 		return
 	}
-	w.mu.Lock()
-	w.pathToID[path] = f.ID
-	w.mu.Unlock()
-	if err := w.publisher.PublishDelta(ctx, delta); err != nil {
-		slog.Warn("publish upsert failed", "rule_id", f.ID, "err", err)
+	if !w.publish(ctx, delta) {
+		slog.Error("upsert delta abandoned at shutdown; registry advanced past the last published delta",
+			"rule_id", f.ID, "path", path)
 		return
 	}
+	w.remember(path, f.ID)
 	slog.Info("rule upserted", "rule_id", f.ID, "rule_version", delta.RuleVersion, "path", path)
+}
+
+// publish ships one delta on RULE_UPDATES, retrying with capped
+// exponential backoff until the broker acks or the context is cancelled.
+// Returns true on success, false only when the context is done (shutdown).
+// Called with fireMu held, so a stuck publish also blocks new edits — RSS
+// stops advancing rule state it cannot ship.
+func (w *Watcher) publish(ctx context.Context, d model.RuleDelta) bool {
+	backoff := publishRetryInitial
+	for attempt := 1; ; attempt++ {
+		if err := w.publisher.PublishDelta(ctx, d); err == nil {
+			return true
+		} else if ctx.Err() != nil {
+			return false
+		} else {
+			slog.Warn("publish delta failed; retrying",
+				"attempt", attempt, "op", d.Operation, "rule_id", d.RuleID, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+		if backoff < publishRetryMax {
+			if backoff *= 2; backoff > publishRetryMax {
+				backoff = publishRetryMax
+			}
+		}
+	}
+}
+
+// remember records that `path` owns `id` in both direction maps. Called
+// after a successful (or no-op) upsert. Mutated under mu.
+func (w *Watcher) remember(path, id string) {
+	w.mu.Lock()
+	w.pathToID[path] = id
+	w.idToPath[id] = path
+	w.mu.Unlock()
+}
+
+// forget drops a path and the id it owned from both maps. Called after a
+// delete lands. Mutated under mu.
+func (w *Watcher) forget(path, id string) {
+	w.mu.Lock()
+	delete(w.pathToID, path)
+	delete(w.idToPath, id)
+	w.mu.Unlock()
 }
 
 // isRuleFile reports whether the path looks like a rule file. We accept

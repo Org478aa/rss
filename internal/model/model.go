@@ -25,8 +25,9 @@ const (
 // drift between RSS's understanding of the schema and LTC's.
 //
 // RuleVersion is per-rule, monotonic on the RSS side: each upsert bumps it
-// by 1 (or more, if the operator races multiple edits). Consumers use it
-// to drop redeliveries and out-of-order deltas for the same rule id.
+// via max(prev+1, time.Now().UnixNano()), so it inherits cross-restart
+// monotonicity from the wall clock. Consumers use it to drop redeliveries
+// and out-of-order deltas for the same rule id.
 type RuleEntry struct {
 	ID          string `json:"rule_id"`
 	YAML        string `json:"yaml"`

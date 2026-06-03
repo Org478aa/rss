@@ -120,10 +120,11 @@ func (r *Registry) Get(id string) (model.RuleEntry, bool) {
 // YAML text) is silent — no version bump, no delta — so an fsnotify
 // event for a re-saved-with-no-changes file does not produce wire churn.
 //
-// On a real change: per-rule version bumps by 1, global version bumps by
-// 1, and the returned RuleDelta carries the new versions plus the new
-// YAML. Caller is responsible for actually publishing the delta — the
-// registry is wire-agnostic.
+// On a real change: per-rule version and global version each advance via
+// bumpVersion (max(prev+1, time.Now().UnixNano())), and the returned
+// RuleDelta carries the new versions plus the new YAML. Caller is
+// responsible for actually publishing the delta — the registry is
+// wire-agnostic.
 func (r *Registry) Upsert(id, yaml string) (model.RuleDelta, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -162,8 +163,10 @@ func (r *Registry) Upsert(id, yaml string) (model.RuleDelta, bool) {
 // The delta's RuleVersion is the pre-deletion version, NOT a fresh bump.
 // Rationale: it lets LTC reconcile a delete with its current state — "the
 // rule you were holding at version N is gone." A future upsert of the same
-// id will carry RuleVersion=1, restarting the per-rule counter; LTC must
-// accept that because the rule has been globally absent in the meantime.
+// id calls bumpVersion(0), which returns time.Now().UnixNano() — a fresh
+// value strictly greater than the deleted version (the per-rule counter is
+// wall-clock-seeded, not reset to 1). LTC accepts it because it advances
+// past the version it last held for that id.
 func (r *Registry) Delete(id string) (model.RuleDelta, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
