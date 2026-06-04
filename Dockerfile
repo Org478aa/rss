@@ -16,7 +16,8 @@ COPY nats/ /src/nats/
 COPY rss/  /src/rss/
 
 WORKDIR /src/rss
-RUN go mod download && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/rss ./cmd/rss
+ARG VERSION=dev
+RUN go mod download && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/rss ./cmd/rss
 
 FROM alpine:3
 # tzdata for symmetry with sibling services even though RSS itself does

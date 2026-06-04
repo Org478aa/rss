@@ -28,6 +28,11 @@ import (
 	"rss/internal/watcher"
 )
 
+// version is the build identifier, injected at build time via
+// -ldflags '-X main.version=...' (see the root Makefile / VERSION file).
+// It defaults to "dev" for un-stamped local builds.
+var version = "dev"
+
 func main() {
 	var (
 		natsURL           = flag.String("nats", nats.DefaultURL, "NATS URL")
@@ -95,7 +100,7 @@ func main() {
 		stopWatcher()
 		stopPub()
 	}
-	slog.Info("rss running", "rules", reg.Len(), "source", reg.Source(), "watch", *rulesDir)
+	slog.Info("rss running", "version", version, "rules", reg.Len(), "source", reg.Source(), "watch", *rulesDir)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
